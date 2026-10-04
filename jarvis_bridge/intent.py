@@ -22,7 +22,11 @@ from typing import Any
 log = logging.getLogger("jarvis.intent")
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-PREFERRED_MODEL = os.environ.get("JARVIS_INTENT_MODEL", "qwen3.5:4b")
+
+
+def preferred_model() -> str:
+    """Read at call time: main loads .env after importing this module."""
+    return os.environ.get("JARVIS_INTENT_MODEL", "qwen3.5:4b")
 QUERY_RE = re.compile(r"^[\w '’\-.,&!?:]{1,80}$", re.UNICODE)
 
 _HINTS = {
@@ -78,15 +82,15 @@ class IntentClassifier:
         if self._model:
             return self._model
         names = self.available_models()
-        if PREFERRED_MODEL in names:
-            self._model = PREFERRED_MODEL
+        if preferred_model() in names:
+            self._model = preferred_model()
         elif names:
             self._model = names[0]
         return self._model
 
     def status(self) -> dict[str, Any]:
         m = self.model()
-        return {"available": m is not None, "model": m, "trusted": m == PREFERRED_MODEL, "preferred": PREFERRED_MODEL}
+        return {"available": m is not None, "model": m, "trusted": m == preferred_model(), "preferred": preferred_model()}
 
     # ----------------------------------------------------------- classify --
     def classify(self, text: str, context: str | None = None) -> IntentResult:
@@ -122,7 +126,7 @@ class IntentClassifier:
         raw = str(data.get("message", {}).get("content", ""))
         intent = self._validate(raw)
         log.info("intent %.1fs model=%s text=%r -> %s", time.time() - t, model, text[:60], intent)
-        return IntentResult(intent=intent, model=model, trusted=model == PREFERRED_MODEL, seconds=time.time() - t, raw=raw)
+        return IntentResult(intent=intent, model=model, trusted=model == preferred_model(), seconds=time.time() - t, raw=raw)
 
     def _validate(self, raw: str) -> dict[str, Any] | None:
         m = re.search(r"\{[\s\S]*\}", raw)

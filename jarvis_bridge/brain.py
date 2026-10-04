@@ -482,7 +482,7 @@ class LocalExtractor:
         'none=non riguarda appunti, promemoria, liste o memoria. Non inventare testo. Rispondi solo con il JSON.'
     )
     OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-    MODEL = os.environ.get("JARVIS_INTENT_MODEL", "qwen3.5:4b")
+    MODEL = property(lambda self: os.environ.get("JARVIS_INTENT_MODEL", "qwen3.5:4b"))
 
     def extract(self, text: str, now: datetime | None = None) -> Command | None:
         body = {

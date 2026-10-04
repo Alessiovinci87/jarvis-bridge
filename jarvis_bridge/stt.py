@@ -81,9 +81,24 @@ class SpeechToText:
             path = fh.name
         try:
             t = time.time()
+            # Quiet laptop microphones (peak ~0.01) make Whisper hear "brava" for "prova":
+            # normalise the level first, so the model sees speech at a sane volume.
+            audio: Any = path
+            try:
+                import numpy as np
+                from faster_whisper.audio import decode_audio
+
+                samples = decode_audio(path, sampling_rate=16000)
+                peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+                if 0.0005 < peak < 0.3:
+                    samples = (samples * (0.5 / peak)).astype(np.float32)
+                    log.info("stt: input gain x%.0f (peak %.3f)", 0.5 / peak, peak)
+                audio = samples
+            except Exception as exc:  # pragma: no cover - fall back to the file
+                log.debug("stt: normalisation skipped: %s", exc)
             with self._lock:
                 segments, info = self._model.transcribe(
-                    path, language=language or None, beam_size=5, initial_prompt=self.prompt, vad_filter=True
+                    audio, language=language or None, beam_size=5, initial_prompt=self.prompt, vad_filter=True
                 )
                 text = " ".join(s.text.strip() for s in segments).strip()
             return {
