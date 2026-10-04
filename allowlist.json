@@ -1,0 +1,47 @@
+{
+  "_comment": "Closed allowlist of desktop actions. The bridge only launches what is listed here; the frontend and the model can only pick an (action, target) pair. Paths are local to this machine. play_music is the only action with a free-text parameter (query): it is sanitised and used solely as a Spotify search string.",
+  "open_app": {
+    "vscode":  { "label": "Visual Studio Code", "kind": "vscode" },
+    "spotify": { "label": "Spotify",            "kind": "store_app", "alias": "Spotify.exe", "aumid": "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify" },
+    "browser": { "label": "Browser",            "kind": "default_browser", "url": "https://www.google.com" }
+  },
+  "open_folder": {
+    "downloads": { "label": "Download", "kind": "known_folder", "known": "downloads" }
+  },
+  "open_project": {
+    "jarvis-ui":  { "label": "Jarvis UI",  "kind": "vscode_project", "path": "C:/Users/aless/jarvis-ui" },
+    "openjarvis": { "label": "OpenJarvis", "kind": "vscode_project", "path": "C:/Users/aless/OpenJarvis" }
+  },
+  "close_app": {
+    "spotify": { "label": "Spotify",            "kind": "close_app", "images": ["Spotify.exe"] },
+    "vscode":  { "label": "Visual Studio Code", "kind": "close_app", "images": ["Code.exe"] },
+    "browser": { "label": "Browser",            "kind": "close_app", "images": ["chrome.exe", "msedge.exe"] }
+  },
+  "timer": {
+    "set":    { "label": "Imposta timer o sveglia", "kind": "timer_set" },
+    "cancel": { "label": "Annulla timer",           "kind": "timer_cancel" },
+    "list":   { "label": "Timer attivi",            "kind": "timer_list" }
+  },
+  "weather": {
+    "forecast": { "label": "Meteo", "kind": "weather", "default_city": "Milano" }
+  },
+  "find_file": {
+    "documents": { "label": "Cerca file", "kind": "find_file", "roots": ["%USERPROFILE%\\Downloads", "%USERPROFILE%\\Documents", "%USERPROFILE%\\Desktop", "%USERPROFILE%\\OneDrive\\Documenti", "%USERPROFILE%\\OneDrive\\Desktop"] },
+    "folders":   { "label": "Cerca cartella", "kind": "find_folder", "roots": ["%USERPROFILE%", "%USERPROFILE%\\Downloads", "%USERPROFILE%\\Documents", "%USERPROFILE%\\Desktop", "%USERPROFILE%\\OneDrive"], "max_depth": 4 }
+  },
+  "web_search": {
+    "browser": { "label": "Ricerca web", "kind": "web_search", "url": "https://www.google.com/search?q=" }
+  },
+  "play_music": {
+    "spotify": { "label": "Spotify", "kind": "spotify_play", "alias": "Spotify.exe", "aumid": "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify" }
+  },
+  "media": {
+    "play_pause":  { "label": "Play/Pausa",        "kind": "media_key", "key": "play_pause" },
+    "next":        { "label": "Brano successivo",  "kind": "media_key", "key": "next" },
+    "previous":    { "label": "Brano precedente",  "kind": "media_key", "key": "previous" },
+    "volume_up":   { "label": "Volume su",         "kind": "media_key", "key": "volume_up" },
+    "volume_down": { "label": "Volume giù",        "kind": "media_key", "key": "volume_down" },
+    "mute":        { "label": "Muto",              "kind": "media_key", "key": "mute" },
+    "now_playing": { "label": "In riproduzione",   "kind": "spotify_info" }
+  }
+}

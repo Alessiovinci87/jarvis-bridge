@@ -1,0 +1,28 @@
+[project]
+name = "jarvis-bridge"
+version = "0.1.0"
+description = "Local action bridge for Jarvis UI: allowlisted Windows desktop actions + offline wake word. Loopback only."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "pydantic>=2",
+  "numpy>=1.26",
+  "sounddevice>=0.5",
+  "openwakeword>=0.6",
+  "onnxruntime>=1.17",
+  "faster-whisper>=1.0",
+  "python-multipart>=0.0.9",
+  "av>=11,<16",
+  "windows-toasts>=1.3.1",
+]
+
+[project.scripts]
+jarvis-bridge = "jarvis_bridge.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["jarvis_bridge"]
