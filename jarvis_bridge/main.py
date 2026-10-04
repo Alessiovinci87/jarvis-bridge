@@ -33,6 +33,7 @@ from .brain import Brain, BrainError
 from .bus import EventBus
 from .google import GoogleError, GoogleSession
 from . import chat as chat_mod
+from .push import Push
 from .routines import load_routines
 from .telegram import Telegram
 from .extras import Timers
@@ -84,12 +85,15 @@ BRAIN = Brain(BUS)
 BRAIN.weather_city = str(ALLOWLIST.get("weather", {}).get("forecast", {}).get("default_city") or "") or None
 TELEGRAM = Telegram(lambda text: BRAIN.handle(text))
 ROUTINES = load_routines(ALLOWLIST)
+PUSH = Push()
 
 
 def _on_reminder(kind: str, item: dict) -> None:
     audit.record("brain", action="reminder", target="fired", accepted=True, executed=True, result=f"#{item['id']}")
-    # On the phone too, when the bot is configured.
-    TELEGRAM.send(("⚠️ " if item.get("priority") == 2 else "⏰ ") + item["text"])
+    # On the phone too: Web Push to the installed PWA (no third party), Telegram only if configured.
+    urgent = item.get("priority") == 2
+    PUSH.send("Jarvis · promemoria" + (" urgente" if urgent else ""), item["text"], tag=f"reminder-{item['id']}")
+    TELEGRAM.send(("⚠️ " if urgent else "⏰ ") + item["text"])
 
 
 BRAIN.on_event(_on_reminder)
@@ -121,7 +125,10 @@ app = FastAPI(title="Jarvis Local Action Bridge", version="0.1.0", lifespan=life
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST"],
+    # The UI served over the tailnet (tailscale serve → https://<pc>.<tailnet>.ts.net): same PC,
+    # requests still arrive from 127.0.0.1 through the local proxy, so loopback_only keeps holding.
+    allow_origin_regex=r"^https://[a-z0-9-]+\.[a-z0-9-]+\.ts\.net(?::\d+)?$",
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["content-type"],
 )
 
@@ -435,6 +442,49 @@ async def chat_stream(req: ChatRequest):
 async def routines():
     """Phrase → sequence of allowlisted steps. The UI matches the phrase and runs steps via POST /actions."""
     return {"routines": ROUTINES}
+
+
+# -------------------------------------------------------------------- push --
+
+
+class PushSubscription(BaseModel):
+    endpoint: str = Field(max_length=2000)
+    keys: dict[str, str]
+    label: str = Field(default="", max_length=60)
+
+
+@app.get("/push/status")
+async def push_status():
+    return PUSH.status()
+
+
+@app.get("/push/public-key")
+async def push_public_key():
+    key = PUSH.public_key()
+    if not key:
+        raise HTTPException(status_code=503, detail={"code": "push_unavailable", "message": "Web Push non disponibile"})
+    return {"public_key": key}
+
+
+@app.post("/push/subscribe")
+async def push_subscribe(sub: PushSubscription, request: Request):
+    try:
+        n = PUSH.subscribe({"endpoint": sub.endpoint, "keys": sub.keys}, sub.label)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"code": "bad_subscription", "message": str(exc)}) from exc
+    audit.record("request", source=audit.source_of(request), method="POST", path="/push/subscribe", accepted=True, executed=True, result=f"{n} devices")
+    return {"ok": True, "subscriptions": n}
+
+
+@app.post("/push/unsubscribe")
+async def push_unsubscribe(body: dict):
+    return {"ok": True, "subscriptions": PUSH.unsubscribe(str(body.get("endpoint", "")))}
+
+
+@app.post("/push/test")
+async def push_test():
+    sent = await asyncio.to_thread(PUSH.send, "Jarvis", "Notifiche attive su questo dispositivo.", tag="test")
+    return {"sent": sent}
 
 
 # ---------------------------------------------------------------- telegram --
