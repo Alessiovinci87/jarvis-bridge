@@ -94,6 +94,9 @@ def record(
 def source_of(request: Any) -> str:
     """Compact origin string: client host + Origin/Referer header when present."""
     host = request.client.host if request.client else "?"
+    user = request.headers.get("tailscale-user-login")
+    if user:
+        host = f"tailnet:{user}@{request.headers.get('x-forwarded-for', host)}"
     origin = request.headers.get("origin") or request.headers.get("referer") or ""
     ua = request.headers.get("user-agent", "")
     parts = [host]

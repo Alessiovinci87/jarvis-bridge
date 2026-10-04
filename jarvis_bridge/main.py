@@ -136,9 +136,12 @@ app.add_middleware(
 @app.middleware("http")
 async def loopback_only(request: Request, call_next):
     client = request.client.host if request.client else ""
-    if client not in ("127.0.0.1", "::1", "testclient"):
+    # Allowed: this PC (loopback), or the tailnet through `tailscale serve`, which only
+    # forwards requests from devices logged into *this* tailnet and stamps the identity header.
+    tailnet = client.startswith("100.") and bool(request.headers.get("tailscale-user-login"))
+    if client not in ("127.0.0.1", "::1", "testclient") and not tailnet:
         audit.record("request", source=audit.source_of(request), method=request.method, path=request.url.path, accepted=False, executed=False, error="loopback only")
-        raise HTTPException(status_code=403, detail="loopback only")
+        return JSONResponse(status_code=403, content={"detail": "loopback or tailnet only"})
     response = await call_next(request)
     path = request.url.path
     detailed = path in ("/actions", "/spotify/intro", "/brain") and request.method == "POST"
