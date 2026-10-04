@@ -23,7 +23,7 @@
     "list":   { "label": "Timer attivi",            "kind": "timer_list" }
   },
   "weather": {
-    "forecast": { "label": "Meteo", "kind": "weather", "default_city": "Milano" }
+    "forecast": { "label": "Meteo", "kind": "weather", "default_city": "Alghero" }
   },
   "find_file": {
     "documents": { "label": "Cerca file", "kind": "find_file", "roots": ["%USERPROFILE%\\Downloads", "%USERPROFILE%\\Documents", "%USERPROFILE%\\Desktop", "%USERPROFILE%\\OneDrive\\Documenti", "%USERPROFILE%\\OneDrive\\Desktop"] },
