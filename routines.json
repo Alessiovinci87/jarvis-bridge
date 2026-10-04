@@ -1,0 +1,19 @@
+{
+  "_readme": "Routine = sequenza di azioni allowlistate eseguite SOLO quando Alessio dice una delle frasi. Ogni step è {action, target, query?} e deve esistere in allowlist.json. Modifica questo file e riavvia il bridge.",
+  "lavoro": {
+    "label": "Modalità lavoro",
+    "phrases": ["modalità lavoro", "si lavora", "al lavoro", "mettiamoci al lavoro"],
+    "steps": [
+      { "action": "open_project", "target": "jarvis-ui" },
+      { "action": "play_music", "target": "spotify", "query": "lofi beats" }
+    ]
+  },
+  "relax": {
+    "label": "Modalità relax",
+    "phrases": ["modalità relax", "stacchiamo", "pausa relax"],
+    "steps": [
+      { "action": "close_app", "target": "vscode" },
+      { "action": "play_music", "target": "spotify", "query": "chill" }
+    ]
+  }
+}

@@ -65,6 +65,15 @@ CASES = [
     # forget with confirmation
     ("dimentica che il codice del cancello è 7788", "forget/remove", "Confermi"),
     ("no", "forget/cancelled", "com'è"),
+    # recurrence, priority, snooze, evening, first
+    ("ricordami ogni lunedì alle 8 di portare fuori il vetro", "reminder/add", "ogni lunedì alle 8:00"),
+    ("ogni giorno alle 7 ricordami le vitamine", "none/none", None),  # time-first phrasing: model fallback
+    ("ricordami tutti i giorni alle 7 di prendere le vitamine", "reminder/add", "ogni giorno alle 7:00"),
+    ("ricordami ogni mese il 27 di pagare l'affitto, è importante", "reminder/add", "ogni mese il 27"),
+    ("ricordami urgente di chiamare il medico oggi alle 17", "reminder/add", "urgente"),
+    ("da dove partiamo?", "today/first", "Partirei da"),
+    ("rimandalo di un'ora", "reminder/snooze", None),
+    ("buonanotte", "today/evening", "buonanotte"),
     # summary
     ("buongiorno", "today/summary", "Oggi"),
     ("cosa mi aspetta oggi", "today/summary", None),

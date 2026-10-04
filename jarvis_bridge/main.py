@@ -32,6 +32,9 @@ from . import audit
 from .brain import Brain, BrainError
 from .bus import EventBus
 from .google import GoogleError, GoogleSession
+from . import chat as chat_mod
+from .routines import load_routines
+from .telegram import Telegram
 from .extras import Timers
 from .intent import IntentClassifier
 from .spotify import SpotifyError, SpotifySession
@@ -79,7 +82,17 @@ STT = SpeechToText(ALLOWLIST)
 GOOGLE = GoogleSession(redirect_uri=f"http://127.0.0.1:{PORT}/google/callback")
 BRAIN = Brain(BUS)
 BRAIN.weather_city = str(ALLOWLIST.get("weather", {}).get("forecast", {}).get("default_city") or "") or None
-BRAIN.on_event(lambda kind, item: audit.record("brain", action="reminder", target="fired", accepted=True, executed=True, result=f"#{item['id']}"))
+TELEGRAM = Telegram(lambda text: BRAIN.handle(text))
+ROUTINES = load_routines(ALLOWLIST)
+
+
+def _on_reminder(kind: str, item: dict) -> None:
+    audit.record("brain", action="reminder", target="fired", accepted=True, executed=True, result=f"#{item['id']}")
+    # On the phone too, when the bot is configured.
+    TELEGRAM.send(("⚠️ " if item.get("priority") == 2 else "⏰ ") + item["text"])
+
+
+BRAIN.on_event(_on_reminder)
 
 
 @asynccontextmanager
@@ -92,10 +105,13 @@ async def lifespan(_: FastAPI):
     log.info("audit log: %s", audit.LOG_PATH)
     audit.record("bridge", result="start", port=PORT, wake_available=available)
     BRAIN.start()
+    TELEGRAM.start()
     log.info("brain db: %s", BRAIN.store.path)
+    log.info("chat: %s", chat_mod.status())
     # Warm the STT model in the background so the first voice command is not slow.
     asyncio.get_running_loop().run_in_executor(None, STT.load)
     yield
+    TELEGRAM.stop()
     BRAIN.stop()
     WAKE.stop()
     audit.record("bridge", result="stop")
@@ -366,6 +382,67 @@ async def google_today():
         return await asyncio.to_thread(GOOGLE.today)
     except GoogleError as exc:
         raise HTTPException(status_code=502, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+# -------------------------------------------------------------------- chat --
+
+
+class ChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str = Field(max_length=8000)
+
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMessage] = Field(min_length=1, max_length=40)
+    temperature: float = Field(default=0.7, ge=0, le=1.5)
+    max_tokens: int = Field(default=350, ge=16, le=2000)
+
+
+@app.get("/chat/status")
+async def chat_status():
+    return chat_mod.status()
+
+
+@app.post("/chat")
+async def chat_stream(req: ChatRequest):
+    """Conversation via Ollama, streamed as SSE: `delta` {text}, then `done` {model, seconds, tokens}; `error` on failure."""
+    msgs = [{"role": m.role, "content": m.content} for m in req.messages]
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def producer() -> None:
+        for ev in chat_mod.stream(msgs, temperature=req.temperature, max_tokens=req.max_tokens):
+            loop.call_soon_threadsafe(queue.put_nowait, ev)
+        loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    threading.Thread(target=producer, daemon=True).start()
+
+    async def gen():
+        while True:
+            ev = await queue.get()
+            if ev is None:
+                break
+            name = "error" if "error" in ev else "done" if ev.get("done") else "delta"
+            yield f"event: {name}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+
+# ---------------------------------------------------------------- routines --
+
+
+@app.get("/routines")
+async def routines():
+    """Phrase → sequence of allowlisted steps. The UI matches the phrase and runs steps via POST /actions."""
+    return {"routines": ROUTINES}
+
+
+# ---------------------------------------------------------------- telegram --
+
+
+@app.get("/telegram/status")
+async def telegram_status():
+    return TELEGRAM.status()
 
 
 # -------------------------------------------------------------------- wake --

@@ -49,10 +49,40 @@ class BrainError(Exception):
 # Storage
 # --------------------------------------------------------------------------- #
 
+class Embedder:
+    """Sentence embeddings from Ollama (nomic-embed-text, ~270 MB, CPU-fast). Optional: any failure → None."""
+
+    def __init__(self, model: str | None = None):
+        self.model = model or os.environ.get("JARVIS_EMBED_MODEL", "nomic-embed-text")
+        self.url = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+        self._ok: bool | None = None
+
+    def embed(self, text: str) -> Any:
+        if self._ok is False:
+            return None
+        try:
+            import numpy as np
+
+            req = urllib.request.Request(f"{self.url}/api/embeddings", data=json.dumps({"model": self.model, "prompt": text[:1000], "keep_alive": "30m"}).encode(),
+                                         headers={"content-type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                vec = np.asarray(json.load(r).get("embedding") or [], dtype=np.float32)
+            if vec.size == 0:
+                return None
+            self._ok = True
+            return vec / (float(np.linalg.norm(vec)) or 1.0)
+        except Exception as exc:
+            if self._ok is None:
+                log.info("embeddings unavailable (%s): semantic search off, full-text only", str(exc)[:80])
+            self._ok = False
+            return None
+
+
 class Store:
-    def __init__(self, path: Path = DB_PATH):
+    def __init__(self, path: Path = DB_PATH, embedder: Embedder | None = None):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
+        self.embedder = embedder
         self._lock = threading.RLock()
         self._db = sqlite3.connect(str(path), check_same_thread=False)
         self._db.row_factory = sqlite3.Row
@@ -88,18 +118,51 @@ class Store:
                 END;
                 """
             )
+            # Migrations (additive only): recurrence, priority, semantic embedding.
+            cols = {r["name"] for r in self._db.execute("PRAGMA table_info(items)")}
+            for name, decl in (("repeat", "TEXT"), ("priority", "INTEGER NOT NULL DEFAULT 0"), ("embedding", "BLOB")):
+                if name not in cols:
+                    self._db.execute(f"ALTER TABLE items ADD COLUMN {name} {decl}")
 
     @staticmethod
     def _row(r: sqlite3.Row) -> dict[str, Any]:
-        return dict(r)
+        d = dict(r)
+        d.pop("embedding", None)  # binary, never serialised
+        d.pop("rank", None)
+        return d
 
-    def add(self, kind: str, text: str, *, list_name: str | None = None, due: datetime | None = None) -> dict[str, Any]:
+    def add(self, kind: str, text: str, *, list_name: str | None = None, due: datetime | None = None,
+            repeat: str | None = None, priority: int = 0) -> dict[str, Any]:
         with self._lock, self._db:
             cur = self._db.execute(
-                "INSERT INTO items(kind, text, list_name, due, created) VALUES (?,?,?,?,?)",
-                (kind, text, list_name, due.isoformat(timespec="minutes") if due else None, datetime.now().isoformat(timespec="seconds")),
+                "INSERT INTO items(kind, text, list_name, due, created, repeat, priority) VALUES (?,?,?,?,?,?,?)",
+                (kind, text, list_name, due.isoformat(timespec="minutes") if due else None,
+                 datetime.now().isoformat(timespec="seconds"), repeat, int(priority)),
             )
-            return self.get(int(cur.lastrowid))
+            item_id = int(cur.lastrowid)
+        if self.embedder is not None and kind in ("note", "fact", "reminder"):
+            threading.Thread(target=self._embed_later, args=(item_id, text), daemon=True).start()
+        return self.get(item_id)
+
+    def _embed_later(self, item_id: int, text: str) -> None:
+        vec = self.embedder.embed(text) if self.embedder else None
+        if vec is None:
+            return
+        with self._lock, self._db:
+            self._db.execute("UPDATE items SET embedding=? WHERE id=?", (vec.tobytes(), item_id))
+
+    def snooze(self, item_id: int, until: datetime) -> dict[str, Any]:
+        """Move a (fired) reminder forward and re-arm it."""
+        with self._lock, self._db:
+            self._db.execute("UPDATE items SET due=?, fired=0, done=0 WHERE id=?", (until.isoformat(timespec="minutes"), item_id))
+        return self.get(item_id)
+
+    def last_fired(self) -> dict[str, Any] | None:
+        with self._lock:
+            r = self._db.execute(
+                "SELECT * FROM items WHERE kind='reminder' AND deleted=0 AND done=0 AND fired=1 ORDER BY due DESC LIMIT 1"
+            ).fetchone()
+        return self._row(r) if r else None
 
     def get(self, item_id: int) -> dict[str, Any]:
         with self._lock:
@@ -184,21 +247,57 @@ class Store:
     def search(self, query: str, *, kinds: tuple[str, ...] = KINDS, limit: int = 8) -> list[dict[str, Any]]:
         """Full-text search (prefix matching on every token), newest first among equal ranks."""
         tokens = [t for t in re.findall(r"\w+", query.lower()) if len(t) >= 3 and t not in _STOP]
-        if not tokens:
-            return []
-        fts = " OR ".join(f'"{t}"*' for t in tokens)
+        placeholders = ",".join("?" for _ in kinds)
+        rows: list[sqlite3.Row] = []
+        if tokens:
+            fts = " OR ".join(f'"{t}"*' for t in tokens)
+            with self._lock:
+                try:
+                    rows = self._db.execute(
+                        f"SELECT i.*, bm25(items_fts) AS rank FROM items_fts JOIN items i ON i.id=items_fts.rowid "
+                        f"WHERE items_fts MATCH ? AND i.deleted=0 AND i.kind IN ({placeholders}) ORDER BY rank, i.created DESC LIMIT ?",
+                        (fts, *kinds, limit),
+                    ).fetchall()
+                except sqlite3.OperationalError as exc:
+                    log.warning("fts query failed: %s", exc)
+        out = [self._row(r) for r in rows]
+        for o in out:
+            o.pop("rank", None)
+            o.pop("embedding", None)
+        # Semantic complement: "quella cosa sul fornitore" finds "il nuovo grossista si chiama Rossi".
+        if self.embedder is not None and len(out) < limit:
+            out = self._semantic(query, kinds, limit, out)
+        return out
+
+    def _semantic(self, query: str, kinds: tuple[str, ...], limit: int, have: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        q = self.embedder.embed(query) if self.embedder else None
+        if q is None:
+            return have
+        import numpy as np
+
         placeholders = ",".join("?" for _ in kinds)
         with self._lock:
-            try:
-                rows = self._db.execute(
-                    f"SELECT i.*, bm25(items_fts) AS rank FROM items_fts JOIN items i ON i.id=items_fts.rowid "
-                    f"WHERE items_fts MATCH ? AND i.deleted=0 AND i.kind IN ({placeholders}) ORDER BY rank, i.created DESC LIMIT ?",
-                    (fts, *kinds, limit),
-                ).fetchall()
-            except sqlite3.OperationalError as exc:
-                log.warning("fts query failed: %s", exc)
-                return []
-        return [self._row(r) for r in rows]
+            rows = self._db.execute(
+                f"SELECT * FROM items WHERE deleted=0 AND embedding IS NOT NULL AND kind IN ({placeholders}) ORDER BY created DESC LIMIT 2000", kinds
+            ).fetchall()
+        seen = {h["id"] for h in have}
+        scored = []
+        for r in rows:
+            if r["id"] in seen:
+                continue
+            v = np.frombuffer(r["embedding"], dtype=np.float32)
+            if v.size != q.size:
+                continue
+            s = float(np.dot(v, q))
+            if s >= 0.62:
+                scored.append((s, r))
+        scored.sort(key=lambda t: -t[0])
+        for s, r in scored[: limit - len(have)]:
+            d = self._row(r)
+            d.pop("embedding", None)
+            d["similarity"] = round(s, 3)
+            have.append(d)
+        return have
 
     def count(self) -> dict[str, int]:
         with self._lock:
@@ -224,6 +323,8 @@ class Command:
     text: str = ""
     list_name: str | None = None
     when: W.When | None = None
+    repeat: str | None = None   # daily | weekly:<0-6> | monthly:<dom> | weekdays
+    priority: int = 0           # 0 normal, 1 important, 2 urgent
     confirm: bool = False   # destructive: needs an explicit yes
     source: str = "rules"   # rules | model
     debug: dict[str, Any] = field(default_factory=dict)
@@ -324,6 +425,106 @@ _TODAY = re.compile(
     re.IGNORECASE,
 )
 
+# --- recurrence / priority / snooze / evening -------------------------------
+_REPEAT = re.compile(
+    r"\b(?:(?P<daily>ogni\s+giorno|tutti\s+i\s+giorni|ogni\s+mattina|tutte\s+le\s+mattine|ogni\s+sera|tutte\s+le\s+sere|quotidian\w+)|"
+    r"(?P<weekdays>(?:ogni|tutti\s+i)\s+giorn[oi]\s+(?:feriali|lavorativ[oi])|dal\s+luned[iì]\s+al\s+venerd[iì])|"
+    r"(?P<weekly>ogni\s+settimana|tutte\s+le\s+settimane|settimanal\w+)|"
+    r"(?:ogni|tutti\s+i|tutte\s+le)\s+(?P<wd>luned[iì]|marted[iì]|mercoled[iì]|gioved[iì]|venerd[iì]|sabat[oi]|domenic[ae])|"
+    r"(?P<monthly>ogni\s+mese|tutti\s+i\s+mesi|mensil\w+)(?:\s+il\s+(?P<dom>\d{1,2}))?)\b",
+    re.IGNORECASE,
+)
+_PRIORITY = re.compile(r"[\s,]*\b(?:(?P<urgent>urgente|urgentissim[oa]|priorit[àa]\s+massima|assolutamente)|(?P<important>importante|priorit[àa]\s+alta|da\s+non\s+dimenticare))\b[\s,!]*", re.IGNORECASE)
+_SNOOZE = re.compile(
+    r"^(?:rimanda(?:lo|la|melo)?|posticipa(?:lo|la|melo)?|rinvia(?:lo|la|melo)?|ricordamelo\s+(?:più\s+tardi|dopo|di\s+nuovo)|più\s+tardi|dopo|non\s+ora|adesso\s+no|snooze)"
+    r"(?:\s+(?P<text>.+?))?(?:\s+(?:di|a|tra|fra|per)\s+(?P<when>.+))?\s*$",
+    re.IGNORECASE,
+)
+_EVENING = re.compile(r"^(?:buonanotte|buona\s+notte|chiudiamo\s+la\s+giornata|riepilogo\s+serale|com['’]?è\s+andata(?:\s+oggi)?|cosa\s+(?:resta|rimane)(?:\s+da\s+fare)?|cosa\s+c['’]è\s+domani|programma\s+di\s+domani)\s*[!?.]*$", re.IGNORECASE)
+_FIRST = re.compile(r"^(?:da\s+dove\s+(?:partiamo|parto|comincio|inizio)|cosa\s+faccio\s+(?:per\s+)?prim[ao]|qual['’]?è\s+la\s+cosa\s+più\s+(?:urgente|importante)|cosa\s+(?:è\s+)?più\s+urgente|priorit[àa](?:\s+di\s+oggi)?)\s*[!?.]*$", re.IGNORECASE)
+_WD_INDEX = {"luned": 0, "marted": 1, "mercoled": 2, "gioved": 3, "venerd": 4, "sabat": 5, "domenic": 6}
+
+
+def _parse_repeat(text: str) -> tuple[str | None, str]:
+    """Returns (repeat code, text without the recurrence words)."""
+    m = _REPEAT.search(text)
+    if not m:
+        return None, text
+    if m.group("daily"):
+        code = "daily"
+    elif m.group("weekdays"):
+        code = "weekdays"
+    elif m.group("weekly"):
+        code = "weekly"
+    elif m.group("wd"):
+        key = next(k for k in _WD_INDEX if m.group("wd").lower().startswith(k))
+        code = f"weekly:{_WD_INDEX[key]}"
+    else:
+        code = f"monthly:{m.group('dom')}" if m.group("dom") else "monthly"
+    rest = (text[: m.start()] + " " + text[m.end():]).strip()
+    # "ogni mattina / ogni sera" carry a default hour when none is given.
+    low = m.group(0).lower()
+    if "mattin" in low and not re.search(r"\balle\b|\d", rest):
+        rest += " alle 8"
+    elif "ser" in low and "sera" in low and not re.search(r"\balle\b|\d", rest):
+        rest += " alle 20"
+    return code, re.sub(r"\s+", " ", rest)
+
+
+def _parse_priority(text: str) -> tuple[int, str]:
+    m = _PRIORITY.search(text)
+    if not m:
+        return 0, text
+    level = 2 if m.group("urgent") else 1
+    return level, re.sub(r"\s+", " ", (text[: m.start()] + " " + text[m.end():])).strip(" ,.")
+
+
+def next_occurrence(due: datetime, repeat: str, now: datetime | None = None) -> datetime | None:
+    """Next due after `due` (and after now) for a recurrence code."""
+    now = now or datetime.now()
+    nxt = due
+    for _ in range(400):
+        if repeat == "daily":
+            nxt += timedelta(days=1)
+        elif repeat == "weekdays":
+            nxt += timedelta(days=1)
+            while nxt.weekday() >= 5:
+                nxt += timedelta(days=1)
+        elif repeat.startswith("weekly"):
+            nxt += timedelta(days=7)
+        elif repeat.startswith("monthly"):
+            month = nxt.month % 12 + 1
+            year = nxt.year + (1 if month == 1 else 0)
+            dom = int(repeat.split(":")[1]) if ":" in repeat else nxt.day
+            for d in range(dom, 27, -1):
+                try:
+                    nxt = nxt.replace(year=year, month=month, day=d)
+                    break
+                except ValueError:
+                    continue
+        else:
+            return None
+        if nxt > now:
+            return nxt
+    return None
+
+
+def describe_repeat(repeat: str | None) -> str:
+    if not repeat:
+        return ""
+    if repeat == "daily":
+        return "ogni giorno"
+    if repeat == "weekdays":
+        return "nei giorni feriali"
+    if repeat.startswith("weekly:"):
+        return "ogni " + W._WEEKDAY_NAMES[int(repeat.split(":")[1])]
+    if repeat == "weekly":
+        return "ogni settimana"
+    if repeat.startswith("monthly:"):
+        return f"ogni mese il {repeat.split(':')[1]}"
+    return "ogni mese"
+
+
 _DAY_WORD = re.compile(r"\b(?:oggi|domani|dopodomani|stasera|stamattina|stanotte|luned|marted|mercoled|gioved|venerd|sabato|domenica|settimana|\d{1,2}/\d{1,2}|il\s+\d{1,2})", re.IGNORECASE)
 _SPLIT_ITEMS = re.compile(r"\s*(?:,|;|\be\b|\bpoi\b|\banche\b|\be\s+anche\b|\+)\s*", re.IGNORECASE)
 _DIRECT_FACT = re.compile(r"^(?:il\s+mio|la\s+mia|i\s+miei|le\s+mie|mia\s+|mio\s+)\s*\w+\s+(?:è|e['’]|sono|si\s+chiama|ha|compie|nasce)\b", re.IGNORECASE)
@@ -395,6 +596,27 @@ def understand(text: str, now: datetime | None = None) -> Command:
         topic = re.sub(r"^(?:qualcosa\s+)?(?:di|su|sul|sulla|riguardo\s+a?|a\s+proposito\s+di|che|se)\s+", "", topic, flags=re.IGNORECASE)
         return Command("recall", "search", text=topic)
 
+    # --- evening wrap-up, "where do I start", snooze of the last fired reminder
+    if _EVENING.match(t):
+        return Command("today", "evening")
+    if _FIRST.match(t):
+        return Command("today", "first")
+    m = _SNOOZE.match(t)
+    if m and len(t.split()) <= 12:
+        when_text = m.group("when") or ""
+        subject = (m.group("text") or "").strip()
+        # "rimandalo di un'ora" → when = "tra un'ora"; "ricordamelo domani" → day word in subject
+        w = W.parse("tra " + when_text, now) if when_text else None
+        if w is None and subject:
+            w = W.parse(subject, now)
+            if w is not None:
+                subject = w.rest
+        if w is None and when_text:
+            w = W.parse(when_text, now)
+        if w is None:
+            w = W.parse("tra 30 minuti", now)
+        return Command("reminder", "snooze", text=re.sub(r"^(?:il|la|lo|quello|quella|questo|questa)\s+", "", subject), when=w)
+
     # --- reminders: shows / cancel / done
     m = _REM_SHOW.match(t)
     if m and not _NOTE_SHOW.match(t):
@@ -419,18 +641,22 @@ def understand(text: str, now: datetime | None = None) -> Command:
     m = _REM_ADD.match(t)
     if m:
         body = m.group("text")
+        priority, body = _parse_priority(body)
+        repeat, body = _parse_repeat(body)
         w = W.parse(body, now)
         verb = re.sub(r"[^\w]", "", low.split()[0])
         note_verb = verb.startswith(("segn", "appunt"))
         # For note-like verbs only a *clear* moment (clock, relative, or day word) makes it a reminder:
         # "segnati che il wifi è lento la mattina" is a note, "segnati che domani ho il dentista" a reminder.
         strong = w is not None and (w.explicit_time or bool(_DAY_WORD.search(w.matched)))
-        if w is not None and (strong or not note_verb):
+        if repeat and w is None:
+            w = W.parse(body + " alle 9", now)  # "ogni lunedì portare fuori il vetro" → 9:00 by default
+        if w is not None and (strong or not note_verb or repeat):
             subject = _subject(w.rest) or _subject(body)
-            return Command("reminder", "add", text=subject, when=w)
+            return Command("reminder", "add", text=subject, when=w, repeat=repeat, priority=priority)
         if verb in ("ricordami", "ricordamelo", "promemoria", "avvisami", "avvertimi", "chiamami", "devo", "dovrei", "ho", "mi", "devi", "fammi", "non") or "promemoria" in low:
             # A reminder without a time: keep it as an open task (due unknown).
-            return Command("reminder", "add", text=_subject(body), when=None)
+            return Command("reminder", "add", text=_subject(body), when=None, priority=priority)
         # "segna / appunta <something>" without a time is a note (below).
 
     # --- facts: "ricordati che …", "il mio X è Y"
@@ -578,7 +804,7 @@ class Outcome:
 class Brain:
     def __init__(self, bus: EventBus, store: Store | None = None, extractor: LocalExtractor | None = None):
         self.bus = bus
-        self.store = store or Store()
+        self.store = store or Store(embedder=Embedder())
         self.extractor = extractor if extractor is not None else LocalExtractor()
         self._pending: tuple[Command, float] | None = None
         self._stop = threading.Event()
@@ -608,6 +834,7 @@ class Brain:
         self._stop.set()
 
     def _loop(self) -> None:
+        last_backup_day: str | None = None
         while not self._stop.wait(5):
             try:
                 for item in self.store.due_now():
@@ -615,11 +842,42 @@ class Brain:
                     self.fire(item)
             except Exception as exc:
                 log.error("reminder loop: %s", exc)
+            day = datetime.now().strftime("%Y-%m-%d")
+            if day != last_backup_day:
+                last_backup_day = day
+                try:
+                    self.backup()
+                except Exception as exc:
+                    log.error("backup: %s", exc)
+
+    def backup(self, keep: int = 14) -> Path | None:
+        """Daily copy of the database (SQLite online backup, safe while in use). JARVIS_BACKUP_DIR overrides the folder."""
+        target_dir = Path(os.environ.get("JARVIS_BACKUP_DIR") or self.store.path.parent / "backups")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"brain-{datetime.now():%Y-%m-%d}.db"
+        if target.exists():
+            return target
+        dest = sqlite3.connect(str(target))
+        try:
+            with self.store._lock:  # noqa: SLF001 - same module
+                self.store._db.backup(dest)  # noqa: SLF001
+        finally:
+            dest.close()
+        old = sorted(target_dir.glob("brain-*.db"))[:-keep]
+        for p in old:
+            p.unlink(missing_ok=True)
+        log.info("backup written: %s", target)
+        return target
 
     def fire(self, item: dict[str, Any]) -> None:
         log.info("reminder due: #%s", item["id"])
-        self.bus.publish({"type": "reminder", "id": item["id"], "text": item["text"], "due": item["due"]})
-        toast("Jarvis · promemoria", item["text"])
+        self.bus.publish({"type": "reminder", "id": item["id"], "text": item["text"], "due": item["due"], "priority": item.get("priority", 0)})
+        toast("Jarvis · promemoria" + (" (urgente)" if item.get("priority") == 2 else ""), item["text"])
+        # Recurring: this occurrence stays as "in sospeso" until done; the next one is scheduled now.
+        if item.get("repeat") and item.get("due"):
+            nxt = next_occurrence(datetime.fromisoformat(item["due"]), item["repeat"])
+            if nxt:
+                self.store.add("reminder", item["text"], due=nxt, repeat=item["repeat"], priority=int(item.get("priority") or 0))
         if self._on_event:
             try:
                 self._on_event("reminder_fired", item)
@@ -672,8 +930,22 @@ class Brain:
     # ----------------------------------------------------------------- run --
     def _run(self, cmd: Command, now: datetime, *, confirmed: bool = False) -> Outcome:
         k, op = cmd.kind, cmd.op
+        if k == "today" and op == "evening":
+            return self.summary(now, mode="evening")
+        if k == "today" and op == "first":
+            return self.first(now)
         if k == "today":
             return self.summary(now, weather=True)
+        if k == "reminder" and op == "snooze":
+            target = None
+            if cmd.text:
+                target = _best_match(cmd.text, self.store.list("reminder", limit=50))
+            target = target or self.store.last_fired()
+            if target is None:
+                return Outcome(True, "Non c'è nessun promemoria da rimandare.", k, op, source=cmd.source)
+            until = cmd.when.at if cmd.when else now + timedelta(minutes=30)
+            item = self.store.snooze(target["id"], until)
+            return Outcome(True, f"Ok, {target['text']}: te lo ricordo {W.describe(until, now)}.", k, op, item=item, source=cmd.source, executed=True)
         if k == "note":
             return self._note(cmd, now)
         if k == "fact":
@@ -723,11 +995,14 @@ class Brain:
             if not cmd.text:
                 return Outcome(True, "Cosa devo ricordarti?", "reminder", "add", source=cmd.source)
             due = cmd.when.at if cmd.when else None
-            item = self.store.add("reminder", cmd.text, due=due)
+            item = self.store.add("reminder", cmd.text, due=due, repeat=cmd.repeat, priority=cmd.priority)
+            tag = " (urgente)" if cmd.priority == 2 else " (importante)" if cmd.priority == 1 else ""
             if due is None:
-                reply = f"Segnato tra le cose da fare: {cmd.text}. Se vuoi un orario, dimmelo."
+                reply = f"Segnato tra le cose da fare{tag}: {cmd.text}. Se vuoi un orario, dimmelo."
+            elif cmd.repeat:
+                reply = f"Ok, {describe_repeat(cmd.repeat)} alle {due.hour}:{due.minute:02d} ti ricordo {cmd.text}{tag}. La prima volta {W.describe(due, now)}."
             else:
-                reply = f"Ok, ti ricordo {cmd.text} {W.describe(due, now)}."
+                reply = f"Ok, ti ricordo {cmd.text}{tag} {W.describe(due, now)}."
                 if cmd.when and not cmd.when.explicit_time:
                     reply += f" Ho messo le {due.hour}:{due.minute:02d}, se preferisci un altro orario dimmelo."
             return Outcome(True, reply, "reminder", "add", item=item, source=cmd.source, executed=True)
@@ -808,11 +1083,38 @@ class Brain:
         return Outcome(False, "")
 
     # --- summary
-    def summary(self, now: datetime | None = None, *, weather: bool = False) -> Outcome:
-        """Spoken briefing. `weather` adds today's forecast for `weather_city` (one network call, best effort)."""
+    def first(self, now: datetime | None = None) -> Outcome:
+        """"Da dove partiamo?": the most pressing item, by priority then by time."""
         now = now or datetime.now()
+        cands = self.store.upcoming(until=now.replace(hour=23, minute=59)) + [r for r in self.store.list("reminder", limit=50) if r["due"] is None]
+        if not cands:
+            return Outcome(True, "Niente in lista: giornata libera, o dimmi cosa aggiungere.", "today", "first")
+        cands.sort(key=lambda r: (-int(r.get("priority") or 0), 0 if r["fired"] else 1, r["due"] or "9999"))
+        top = cands[0]
+        why = "è urgente" if top.get("priority") == 2 else "è importante" if top.get("priority") == 1 else "è in sospeso" if top["fired"] else "è il primo in ordine di tempo"
+        when = f", {W.describe(datetime.fromisoformat(top['due']), now)}" if top["due"] else ""
+        rest = f" Poi: {'; '.join(r['text'] for r in cands[1:3])}." if len(cands) > 1 else ""
+        return Outcome(True, f"Partirei da {top['text']}{when}: {why}.{rest}", "today", "first", items=cands[:3])
+
+    def summary(self, now: datetime | None = None, *, weather: bool = False, mode: str = "morning") -> Outcome:
+        """Spoken briefing. `weather` adds today's forecast for `weather_city` (one network call, best effort).
+        `mode='evening'`: what is left today and what tomorrow brings."""
+        now = now or datetime.now()
+        if mode == "evening":
+            left = [r for r in self.store.upcoming(until=now.replace(hour=23, minute=59)) if not r["done"]]
+            tmr = (now + timedelta(days=1)).replace(hour=0, minute=0)
+            tomorrow = [r for r in self.store.upcoming(until=tmr + timedelta(days=1)) if r["due"] and r["due"] >= tmr.isoformat(timespec="minutes")]
+            open_tasks = [r for r in self.store.list("reminder", limit=50) if r["due"] is None]
+            parts = []
+            parts.append("oggi resta in sospeso: " + "; ".join(r["text"] for r in left) if left else "oggi hai chiuso tutto")
+            if open_tasks:
+                parts.append(f"{len(open_tasks)} cos{'a' if len(open_tasks) == 1 else 'e'} da fare senza data: " + "; ".join(r["text"] for r in open_tasks[:4]))
+            parts.append("domani hai " + "; ".join(f"{r['text']} alle {datetime.fromisoformat(r['due']).strftime('%H:%M')}" for r in tomorrow[:5]) if tomorrow else "domani per ora è libero")
+            parts.append("buonanotte")
+            return Outcome(True, ". ".join(p[0].upper() + p[1:] for p in parts) + ".", "today", "evening", items=left + tomorrow)
         end = now.replace(hour=23, minute=59)
         today = self.store.upcoming(until=end)
+        today.sort(key=lambda r: (-int(r.get("priority") or 0), r["due"] or ""))
         overdue = [r for r in today if r["fired"]]
         ahead = [r for r in today if not r["fired"]]
         open_tasks = [r for r in self.store.list("reminder", limit=50) if r["due"] is None]

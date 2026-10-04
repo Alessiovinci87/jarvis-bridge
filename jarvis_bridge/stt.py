@@ -53,6 +53,7 @@ class SpeechToText:
         self._model: Any = None
         self._lock = threading.Lock()
         self._error: str | None = None
+        self.last_peak: float | None = None
 
     def load(self) -> bool:
         with self._lock:
@@ -71,7 +72,8 @@ class SpeechToText:
                 return False
 
     def status(self) -> dict[str, Any]:
-        return {"available": self._error is None, "loaded": self._model is not None, "model": MODEL_SIZE, "reason": self._error}
+        return {"available": self._error is None, "loaded": self._model is not None, "model": MODEL_SIZE, "reason": self._error,
+                "last_peak": round(self.last_peak, 4) if self.last_peak is not None else None}
 
     def transcribe(self, data: bytes, suffix: str = ".wav", language: str = "it") -> dict[str, Any]:
         if not self.load():
@@ -90,6 +92,7 @@ class SpeechToText:
 
                 samples = decode_audio(path, sampling_rate=16000)
                 peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+                self.last_peak = peak  # exposed in /stt/health so the UI can warn about a muted/quiet mic
                 if 0.0005 < peak < 0.3:
                     samples = (samples * (0.5 / peak)).astype(np.float32)
                     log.info("stt: input gain x%.0f (peak %.3f)", 0.5 / peak, peak)
